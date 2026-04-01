@@ -1,6 +1,6 @@
-# Medical Protocol RAG System — Kazakhstan Clinical Guidelines
+# Medical Protocol RAG System
 
-A two-stage pipeline for scraping, parsing, and querying Kazakhstan clinical protocols from [diseases.medelement.com](https://diseases.medelement.com).
+A two-stage pipeline for scraping, parsing, and querying protocols from [diseases.medelement.com](https://diseases.medelement.com).
 
 ```
 pipeline/   ← data engineering: scrape → parse → chunk → JSONL
