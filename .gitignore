@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# ── Data — large generated files, never commit ────────────────────────────────
+# Keep directory skeletons via .gitkeep files; ignore actual data
+data/output/*.jsonl
+data/*.db
+data/*.db-shm
+data/*.db-wal
+# Allow .gitkeep so directory structure is tracked
+!data/.gitkeep
+!data/output/.gitkeep
+
+# ── Secrets ───────────────────────────────────────────────────────────────────
+.env
+# .env.example should NOT be ignored — commit it as a template
+
+# ── ML model caches (if downloaded locally into project dir) ─────────────────
+# sentence-transformers / HuggingFace normally cache to ~/.cache/huggingface/
+# If someone sets HF_HOME or SENTENCE_TRANSFORMERS_HOME to a project subdir:
+models/
+.cache/
+huggingface/
+
+# ── IDE ───────────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+
+# ── Playwright ────────────────────────────────────────────────────────────────
+playwright/.local-browsers/
+
+# ── Test / coverage artifacts ─────────────────────────────────────────────────
+.coverage
+htmlcov/
+.pytest_cache/
