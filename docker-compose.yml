@@ -21,7 +21,7 @@ services:
 
   pipeline:
     image: rag-app
-    command: python pipeline/orchestrator.py
+    command: python -m pipeline.orchestrator
     env_file:
       - .env
     depends_on:
