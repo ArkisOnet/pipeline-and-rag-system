@@ -65,5 +65,8 @@ class Settings(BaseSettings):
     ANTHROPIC_API_KEY: str = ""
     CLAUDE_MODEL: str = "claude-sonnet-4-6"
 
+    # ── Medical API ───────────────────────────────────────────────────────────
+    API_KEY: str = ""
+
 
 settings = Settings()

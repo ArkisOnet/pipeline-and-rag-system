@@ -28,13 +28,14 @@ import sys
 import httpx
 
 from config.settings import settings
+from rag.prompts import SYSTEM_PROMPT
 from rag.retriever import Retriever, SearchResult
 
 logger = logging.getLogger(__name__)
 
 # Medical API configuration
 MEDICAL_API_URL = "http://3.84.177.26:8000/medical-query"
-MEDICAL_API_KEY = os.getenv("API_KEY", settings.get("API_KEY", ""))
+MEDICAL_API_KEY = settings.API_KEY or os.getenv("API_KEY", "")
 
 _CONTEXT_TEMPLATE = """\
 --- Источник {i}: {protocol} ({section}) ---
@@ -50,7 +51,7 @@ def _build_context(results: list[SearchResult]) -> str:
             i=i,
             protocol=r.protocol_name,
             section=r.section,
-            text=r.text[:800],
+            text=r.text[:300],
         ))
     return "\n".join(parts)
 
@@ -91,16 +92,17 @@ def _call_medical_api(question: str, context: str, max_tokens: int = 1024) -> st
     params = {
         "question": question,
         "context": context,
+        "system_prompt": SYSTEM_PROMPT,
         "max_tokens": max_tokens,
-        "language": "ru"  # Default to Russian, API will auto-detect
+        "language": "ru",
     }
-    
+
     try:
         response = httpx.post(
             MEDICAL_API_URL,
             headers=headers,
             params=params,
-            timeout=60.0  # 60 second timeout for model inference
+            timeout=60.0,
         )
         response.raise_for_status()
         
