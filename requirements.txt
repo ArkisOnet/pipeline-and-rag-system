@@ -11,6 +11,10 @@ html2text==2024.2.26
 # ── RAG chunking ─────────────────────────────────────────────────────────────
 langchain-text-splitters==0.2.4
 
+# ── Services data (xlsx parsing) ─────────────────────────────────────────────
+pandas==2.2.2
+openpyxl==3.1.3
+
 # ── Configuration ─────────────────────────────────────────────────────────────
 pydantic-settings==2.3.4
 python-dotenv==1.0.1

@@ -55,6 +55,7 @@ class Settings(BaseSettings):
 
     # ── RAG: Retrieval ────────────────────────────────────────────────────────
     TOP_K: int = 5
+    MIN_SIMILARITY_SCORE: float = 0.70
 
     # ── RAG: Answer generation — Ollama (local, default) ─────────────────────
     LLM_BACKEND: str = "ollama"           # "ollama" | "anthropic"
@@ -64,6 +65,10 @@ class Settings(BaseSettings):
     # ── RAG: Answer generation — Anthropic (optional) ─────────────────────────
     ANTHROPIC_API_KEY: str = ""
     CLAUDE_MODEL: str = "claude-sonnet-4-6"
+
+    # ── Services data source ─────────────────────────────────────────────────
+    SERVICES_XLSX_PATH: str = "data/raw/services.xlsx"
+    SERVICES_COLLECTION: str = "medservices"
 
     # ── Medical API ───────────────────────────────────────────────────────────
     API_KEY: str = ""
