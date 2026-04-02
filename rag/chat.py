@@ -161,6 +161,20 @@ def _call_medical_api(question: str, context: str, max_tokens: int = 1024) -> st
         raise ValueError(f"Unexpected error calling medical API: {e}")
 
 
+def _get_response(question: str, top_k: int, max_tokens: int) -> str:
+    retriever = Retriever()
+    try: 
+        results = retriever.search(question, top_k=top_k)
+        context = _build_context(results)
+
+        answer = _call_medical_api(question, context, max_tokens=max_tokens)
+
+        return answer, results
+    except Exception as e:
+        logger.error(f"Error in _get_response: {e}")
+        raise
+        
+
 # ── Main chat loop ────────────────────────────────────────────────────────────
 
 def _try_service_retriever() -> Retriever | None:
