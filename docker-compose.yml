@@ -27,5 +27,14 @@ services:
     depends_on:
       - qdrant
 
+  indexer:
+    image: rag-app
+    command: python -m rag.indexer --recreate
+    env_file:
+      - .env
+    depends_on:
+      - qdrant
+      - pipeline
+
 volumes:
   qdrant_data:
