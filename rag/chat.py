@@ -125,7 +125,7 @@ def _call_medical_api(question: str, context: str, max_tokens: int = 1024) -> st
         "Authorization": f"Bearer {MEDICAL_API_KEY}"
     }
     
-    params = {
+    body = {
         "question": question,
         "context": context,
         "system_prompt": SYSTEM_PROMPT,
@@ -137,7 +137,7 @@ def _call_medical_api(question: str, context: str, max_tokens: int = 1024) -> st
         response = httpx.post(
             MEDICAL_API_URL,
             headers=headers,
-            params=params,
+            json=body,
             timeout=60.0,
         )
         response.raise_for_status()
