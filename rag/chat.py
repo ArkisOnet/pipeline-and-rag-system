@@ -1,18 +1,16 @@
 """
 Interactive CLI chat interface for the Medical RAG system.
 
-Uses a local Ollama instance for answer generation (no API key required).
-Falls back to Anthropic Claude if ANTHROPIC_API_KEY is set in .env.
+Uses the deployed medical API endpoint at http://3.84.177.26:8000/medical-query
 
 Run:
-    python -m rag.chat [--model llama3.2] [--top-k 5] [--category Кардиология]
-    python -m rag.chat --backend anthropic --model claude-sonnet-4-6
+    python -m rag.chat [--top-k 5] [--category Кардиология]
 
 Prereqs:
-    pip install qdrant-client sentence-transformers
+    pip install qdrant-client sentence-transformers httpx
     docker run -p 6333:6333 qdrant/qdrant
-    ollama pull llama3.2   (or any other model)
     python -m rag.indexer  (run once to populate Qdrant)
+    Set API_KEY environment variable or in .env file
 
 Commands during chat:
     /quit or /exit  — exit
@@ -24,6 +22,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sys
 
 import httpx
@@ -33,13 +32,9 @@ from rag.retriever import Retriever, SearchResult
 
 logger = logging.getLogger(__name__)
 
-_SYSTEM_PROMPT = """\
-Ты медицинский ассистент, специализирующийся на клинических протоколах Казахстана.
-Отвечай на вопросы строго на основе предоставленного контекста из клинических протоколов.
-Если информации недостаточно — честно сообщи об этом.
-Всегда указывай источник (название протокола и раздел) при цитировании.
-Отвечай на том же языке, на котором задан вопрос (русский или английский).
-"""
+# Medical API configuration
+MEDICAL_API_URL = "http://3.84.177.26:8000/medical-query"
+MEDICAL_API_KEY = os.getenv("API_KEY", settings.get("API_KEY", ""))
 
 _CONTEXT_TEMPLATE = """\
 --- Источник {i}: {protocol} ({section}) ---
@@ -48,6 +43,7 @@ _CONTEXT_TEMPLATE = """\
 
 
 def _build_context(results: list[SearchResult]) -> str:
+    """Build context string from search results for the API."""
     parts = []
     for i, r in enumerate(results, 1):
         parts.append(_CONTEXT_TEMPLATE.format(
@@ -60,6 +56,7 @@ def _build_context(results: list[SearchResult]) -> str:
 
 
 def _format_sources(results: list[SearchResult]) -> str:
+    """Format source citations for display."""
     lines = ["\nИсточники:"]
     for i, r in enumerate(results, 1):
         lines.append(f"  [{i}] {r.protocol_name} — {r.section}")
@@ -67,56 +64,91 @@ def _format_sources(results: list[SearchResult]) -> str:
     return "\n".join(lines)
 
 
-# ── LLM backends ─────────────────────────────────────────────────────────────
-
-def _ollama_chat(messages: list[dict], model: str, ollama_url: str) -> str:
-    """Send messages to Ollama /api/chat and return the assistant reply."""
-    payload = {
-        "model": model,
-        "messages": messages,
-        "stream": False,
+def _call_medical_api(question: str, context: str, max_tokens: int = 1024) -> str:
+    """
+    Call the medical API endpoint.
+    
+    Args:
+        question: User's medical question
+        context: Context from clinical protocols
+        max_tokens: Maximum tokens for response
+        
+    Returns:
+        str: The answer from the medical assistant
+        
+    Raises:
+        httpx.HTTPError: If API request fails
+    """
+    if not MEDICAL_API_KEY:
+        raise ValueError(
+            "API_KEY not set. Please set API_KEY environment variable or in .env file"
+        )
+    
+    headers = {
+        "Authorization": f"Bearer {MEDICAL_API_KEY}"
     }
-    resp = httpx.post(f"{ollama_url}/api/chat", json=payload, timeout=120)
-    resp.raise_for_status()
-    return resp.json()["message"]["content"]
-
-
-def _anthropic_chat(messages: list[dict], model: str) -> str:
+    
+    params = {
+        "question": question,
+        "context": context,
+        "max_tokens": max_tokens,
+        "language": "ru"  # Default to Russian, API will auto-detect
+    }
+    
     try:
-        import anthropic
-    except ImportError:
-        raise ImportError("anthropic not installed. Run: pip install anthropic")
-    client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
-    response = client.messages.create(
-        model=model,
-        max_tokens=1024,
-        system=_SYSTEM_PROMPT,
-        messages=messages,
-    )
-    return response.content[0].text
+        response = httpx.post(
+            MEDICAL_API_URL,
+            headers=headers,
+            params=params,
+            timeout=60.0  # 60 second timeout for model inference
+        )
+        response.raise_for_status()
+        
+        # Parse JSON response and extract answer
+        data = response.json()
+        return data.get("answer", data.get("text", str(data)))
+        
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 401:
+            raise ValueError("Invalid API_KEY. Check your authorization.")
+        elif e.response.status_code == 403:
+            raise ValueError("API_KEY forbidden. Check your credentials.")
+        elif e.response.status_code == 503:
+            raise ValueError("Medical API service unavailable. Model may be loading.")
+        else:
+            raise ValueError(f"API error {e.response.status_code}: {e.response.text}")
+    except httpx.TimeoutException:
+        raise ValueError("Request timed out. The model may be processing a large request.")
+    except Exception as e:
+        raise ValueError(f"Unexpected error calling medical API: {e}")
 
 
 # ── Main chat loop ────────────────────────────────────────────────────────────
 
 def chat(
-    model: str = settings.OLLAMA_MODEL,
-    top_k: int = settings.TOP_K,
+    top_k: int = settings.TOP_K if hasattr(settings, 'TOP_K') else 5,
     category: str | None = None,
-    backend: str = settings.LLM_BACKEND,
-    ollama_url: str = settings.OLLAMA_URL,
+    max_tokens: int = 1024,
 ) -> None:
+    """
+    Run interactive chat loop with medical RAG system.
+    
+    Args:
+        top_k: Number of search results to retrieve
+        category: Optional category filter
+        max_tokens: Maximum tokens for API responses
+    """
     retriever = Retriever()
     filters = {"category": category} if category else None
 
     print(f"\n=== Medical Protocol RAG — Kazakhstan Clinical Guidelines ===")
-    print(f"Backend: {backend} | Model: {model}")
+    print(f"API Endpoint: {MEDICAL_API_URL}")
+    print(f"API Key: {'✓ Set' if MEDICAL_API_KEY else '✗ NOT SET'}")
     print("Type your question in Russian or English. Commands: /quit /clear /sources")
     if category:
         print(f"Filter: category = {category}")
     print()
 
-    # Ollama keeps system prompt as first message in history
-    history: list[dict] = [{"role": "system", "content": _SYSTEM_PROMPT}]
     last_sources: list[SearchResult] = []
 
     while True:
@@ -128,14 +160,16 @@ def chat(
 
         if not query:
             continue
+            
         if query.lower() in ("/quit", "/exit"):
             print("Bye.")
             break
+            
         if query.lower() == "/clear":
-            history = [{"role": "system", "content": _SYSTEM_PROMPT}]
             last_sources.clear()
             print("Conversation cleared.")
             continue
+            
         if query.lower() == "/sources":
             if last_sources:
                 print(_format_sources(last_sources))
@@ -143,33 +177,33 @@ def chat(
                 print("No sources from previous answer.")
             continue
 
-        results = retriever.search(query, top_k=top_k, filters=filters)
-        last_sources = results
+        # Retrieve relevant protocol sections
+        try:
+            results = retriever.search(query, top_k=top_k, filters=filters)
+            last_sources = results
+        except Exception as e:
+            print(f"[Retrieval error: {e}]")
+            continue
 
         if not results:
             print("Assistant: Релевантные протоколы не найдены. Попробуйте переформулировать вопрос.\n")
             continue
 
+        # Build context from retrieved results
         context = _build_context(results)
-        user_message = f"Контекст из клинических протоколов:\n\n{context}\n\nВопрос: {query}"
-        history.append({"role": "user", "content": user_message})
 
+        # Call medical API
         try:
-            if backend == "ollama":
-                answer = _ollama_chat(history, model=model, ollama_url=ollama_url)
-            else:
-                # For Anthropic, strip system message from history (passed separately)
-                answer = _anthropic_chat(
-                    [m for m in history if m["role"] != "system"],
-                    model=model,
-                )
+            answer = _call_medical_api(
+                question=query,
+                context=context,
+                max_tokens=max_tokens
+            )
         except Exception as exc:
-            print(f"[LLM error: {exc}]")
-            history.pop()  # remove unanswered user turn
+            print(f"[API error: {exc}]")
             continue
 
-        history.append({"role": "assistant", "content": answer})
-
+        # Display answer and sources
         print(f"\nAssistant: {answer}")
         print(_format_sources(results))
         print()
@@ -177,27 +211,53 @@ def chat(
 
 def main() -> None:
     import argparse
+    
     parser = argparse.ArgumentParser(description="Medical RAG Chat CLI")
-    parser.add_argument("--model", default=settings.OLLAMA_MODEL,
-                        help=f"LLM model name (default: {settings.OLLAMA_MODEL})")
-    parser.add_argument("--top-k", type=int, default=settings.TOP_K,
-                        help=f"Number of retrieved chunks (default: {settings.TOP_K})")
-    parser.add_argument("--category", default=None,
-                        help="Filter by medical specialty, e.g. 'Кардиология'")
-    parser.add_argument("--backend", default=settings.LLM_BACKEND,
-                        choices=["ollama", "anthropic"],
-                        help=f"LLM backend (default: {settings.LLM_BACKEND})")
-    parser.add_argument("--ollama-url", default=settings.OLLAMA_URL,
-                        help=f"Ollama base URL (default: {settings.OLLAMA_URL})")
+    parser.add_argument(
+        "--top-k", 
+        type=int, 
+        default=5,
+        help="Number of retrieved chunks (default: 5)"
+    )
+    parser.add_argument(
+        "--category", 
+        default=None,
+        help="Filter by medical specialty, e.g. 'Кардиология'"
+    )
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=1024,
+        help="Maximum tokens for API response (default: 1024)"
+    )
+    parser.add_argument(
+        "--api-key",
+        default=None,
+        help="API key for medical endpoint (overrides env variable)"
+    )
+    
     args = parser.parse_args()
 
+    # Override API key if provided
+    if args.api_key:
+        global MEDICAL_API_KEY
+        MEDICAL_API_KEY = args.api_key
+
+    # Check API key is set
+    if not MEDICAL_API_KEY:
+        print("ERROR: API_KEY not set!")
+        print("Set it via:")
+        print("  1. Environment variable: export API_KEY='your-key'")
+        print("  2. Command line: python -m rag.chat --api-key 'your-key'")
+        print("  3. .env file with API_KEY=your-key")
+        sys.exit(1)
+
     logging.basicConfig(level=logging.WARNING)
+    
     chat(
-        model=args.model,
         top_k=args.top_k,
         category=args.category,
-        backend=args.backend,
-        ollama_url=args.ollama_url,
+        max_tokens=args.max_tokens,
     )
 
 
