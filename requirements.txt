@@ -41,3 +41,8 @@ pytest-cov==5.0.0
 
 # ── Optional: OCR for scanned image tables ────────────────────────────────────
 # easyocr>=1.7.0
+
+# API server (optional, for serving the RAG system) ─────────────────────────────
+
+fastapi==0.140.0
+uvicorn==0.34.0
