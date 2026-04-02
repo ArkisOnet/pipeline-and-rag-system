@@ -10,4 +10,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 # optional: если используешь playwright
-RUN playwright install
+RUN playwright install --with-deps
