@@ -188,6 +188,10 @@ def main() -> None:
         output_path=args.output,
     ))
 
+    from rag.indexer import main as indexer_main
+
+    indexer_main()
+
 
 if __name__ == "__main__":
     main()

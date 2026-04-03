@@ -125,7 +125,7 @@ def _call_medical_api(question: str, context: str, max_tokens: int = 1024) -> st
         "Authorization": f"Bearer {MEDICAL_API_KEY}"
     }
     
-    params = {
+    body = {
         "question": question,
         "context": context,
         "system_prompt": SYSTEM_PROMPT,
@@ -137,7 +137,7 @@ def _call_medical_api(question: str, context: str, max_tokens: int = 1024) -> st
         response = httpx.post(
             MEDICAL_API_URL,
             headers=headers,
-            params=params,
+            json=body,
             timeout=60.0,
         )
         response.raise_for_status()
@@ -160,6 +160,20 @@ def _call_medical_api(question: str, context: str, max_tokens: int = 1024) -> st
     except Exception as e:
         raise ValueError(f"Unexpected error calling medical API: {e}")
 
+
+def _get_response(question: str, top_k: int, max_tokens: int) -> str:
+    retriever = Retriever()
+    try: 
+        results = retriever.search(question, top_k=top_k)
+        context = _build_service_context(results)
+
+        answer = _call_medical_api(question, context, max_tokens=max_tokens)
+
+        return answer, results
+    except Exception as e:
+        logger.error(f"Error in _get_response: {e}")
+        raise
+        
 
 # ── Main chat loop ────────────────────────────────────────────────────────────
 
