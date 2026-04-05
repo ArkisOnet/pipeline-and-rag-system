@@ -177,7 +177,7 @@ def _call_medical_api(
             MEDICAL_API_URL,
             headers={"Authorization": f"Bearer {MEDICAL_API_KEY}"},
             json=payload,
-            timeout=60.0,
+            timeout=150.0,
         )
         resp.raise_for_status()
         data = resp.json()
