@@ -55,7 +55,9 @@ class Settings(BaseSettings):
 
     # ── RAG: Retrieval ────────────────────────────────────────────────────────
     TOP_K: int = 5
-    MIN_SIMILARITY_SCORE: float = 0.70
+    MIN_SIMILARITY_SCORE: float = 0.70   # default / doctor threshold
+    DOCTOR_MIN_SCORE: float = 0.60
+    PATIENT_MIN_SCORE: float = 0.40
 
     # ── RAG: Answer generation — Ollama (local, default) ─────────────────────
     LLM_BACKEND: str = "ollama"           # "ollama" | "anthropic"

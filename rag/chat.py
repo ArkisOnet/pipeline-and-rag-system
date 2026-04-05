@@ -1,44 +1,48 @@
 """
 Interactive CLI chat interface for the Medical RAG system.
 
-Uses the deployed medical API endpoint at http://3.84.177.26:8000/medical-query
-
-Run:
-    python -m rag.chat [--top-k 5] [--category Кардиология]
-
-Prereqs:
-    pip install qdrant-client sentence-transformers httpx
-    docker run -p 6333:6333 qdrant/qdrant
-    python -m rag.indexer  (run once to populate Qdrant)
-    Set API_KEY environment variable or in .env file
+Roles:
+    doctor  — raw query sent to Qdrant (ICD codes preserved), strict clinical output
+    patient — query cleaned to 2-3 keywords before Qdrant, plain-language output
 
 Commands during chat:
-    /quit or /exit  — exit
-    /clear          — clear conversation history
-    /sources        — show sources from last answer
+    /doctor   — switch to doctor mode
+    /patient  — switch to patient mode
+    /clear    — clear last sources
+    /sources  — show sources from last answer
+    /quit     — exit
+
+Run:
+    python -m rag.chat [--role patient] [--category Кардиология]
 """
 
 from __future__ import annotations
 
-import json
 import logging
 import os
+import re
 import sys
 
 import httpx
 
 from config.settings import settings
-from rag.prompts import SYSTEM_PROMPT
+from rag.prompts import DOCTOR_PROMPT, PATIENT_SYSTEM_PROMPT, QUERY_CLEANUP_PROMPT
 from rag.retriever import Retriever, SearchResult, extract_icd_codes
 
 logger = logging.getLogger(__name__)
 
-# Medical API configuration
 MEDICAL_API_URL = "http://3.84.177.26:8000/medical-query"
 MEDICAL_API_KEY = settings.API_KEY or os.getenv("API_KEY", "")
 
+_ROLES = {
+    "doctor":  {"label": "Врач",    "min_score": settings.DOCTOR_MIN_SCORE},
+    "patient": {"label": "Пациент", "min_score": settings.PATIENT_MIN_SCORE},
+}
+
 _PROTOCOL_TEMPLATE = "--- Протокол {i}: {protocol} ({section}) ---\n{text}"
 
+
+# ── Context builders ──────────────────────────────────────────────────────────
 
 def _build_protocol_context(results: list[SearchResult]) -> str:
     parts = []
@@ -53,46 +57,52 @@ def _build_protocol_context(results: list[SearchResult]) -> str:
 
 
 def _build_service_context(results: list[SearchResult]) -> str:
-    """Compact text sent to the LLM — lets it reference services without reproducing a table."""
+    """Text for LLM — ICD codes and service IDs omitted so the model never echoes them."""
     lines = []
     for i, r in enumerate(results, 1):
         m = r.metadata
         lines.append(
-            f"{i}. {m.get('service_name', '—')} "
-            f"(МКБ: {m.get('icd_code', '—')}, "
-            f"цена: {m.get('price', '—')}, "
-            f"место: {m.get('place_of_service', '—')})"
+            f"{i}. Услуга: {m.get('service_name', '—')} | "
+            f"Цена: {m.get('price', '—')} | "
+            f"Место: {m.get('place_of_service', '—')}"
         )
     return "\n".join(lines)
 
 
 def _render_service_table(results: list[SearchResult]) -> str:
-    """Clean GFM Markdown table shown directly to the user after the LLM answer."""
-    header = "| № | Услуга | Код услуги | МКБ-10 | Диагноз | Цена | Место оказания |"
-    sep    = "|---|--------|------------|--------|---------|------|----------------|"
-    rows = []
-    for i, r in enumerate(results, 1):
-        m = r.metadata
-        rows.append(
-            f"| {i} "
-            f"| {m.get('service_name', '—')} "
-            f"| {m.get('service_code', '—')} "
-            f"| {m.get('icd_code', '—')} "
-            f"| {m.get('diagnosis', '—')} "
-            f"| {m.get('price', '—')} "
-            f"| {m.get('place_of_service', '—')} |"
-        )
+    """3-column GFM table rendered for doctor mode — no codes."""
+    header = "| Услуга | Примерная цена | Где оказывается |"
+    sep    = "|--------|---------------|-----------------|"
+    rows = [
+        f"| {r.metadata.get('service_name', '—')} "
+        f"| {r.metadata.get('price', '—')} "
+        f"| {r.metadata.get('place_of_service', '—')} |"
+        for r in results
+    ]
     return "\n".join([header, sep] + rows)
 
 
-def _format_sources(protocol_results: list[SearchResult], service_results: list[SearchResult]) -> str:
-    """Single source block appended once at the end of each response."""
+def _is_valid_url(url: str) -> bool:
+    """Reject empty strings and garbled Cyrillic URLs like 'ащщщщ'."""
+    if not url:
+        return False
+    try:
+        url.encode("ascii")
+    except UnicodeEncodeError:
+        return False
+    return url.startswith("http")
+
+
+def _format_sources(
+    protocol_results: list[SearchResult],
+    service_results: list[SearchResult],
+) -> str:
     lines = ["\n---\n**Источники:**"]
     if protocol_results:
         lines.append("*Клинические протоколы МЗ РК*")
         for i, r in enumerate(protocol_results, 1):
             line = f"  [{i}] {r.protocol_name} — {r.section}"
-            if r.source_url:
+            if _is_valid_url(r.source_url):
                 line += f"  <{r.source_url}>"
             lines.append(line)
     if service_results:
@@ -101,190 +111,295 @@ def _format_sources(protocol_results: list[SearchResult], service_results: list[
     return "\n".join(lines)
 
 
-def _call_medical_api(question: str, context: str, max_tokens: int = 1024) -> str:
+def _strip_source_refs(text: str) -> str:
     """
-    Call the medical API endpoint.
-    
-    Args:
-        question: User's medical question
-        context: Context from clinical protocols
-        max_tokens: Maximum tokens for response
-        
-    Returns:
-        str: The answer from the medical assistant
-        
-    Raises:
-        httpx.HTTPError: If API request fails
+    Remove source markers from patient-mode answers so users never see
+    [1], [2-3], [Protocol: ...], [Section: ...], or a trailing source block.
+    """
+    # Remove inline reference numbers: [1], [2], [1,2], [1-3]
+    text = re.sub(r"\[\d+(?:[,\-]\d+)*\]", "", text)
+    # Remove trailing [Protocol: ...] / [Section: ...] blocks and everything after
+    text = re.sub(
+        r"\n+\[(?:Protocol|Section)[^\]]*\].*$",
+        "",
+        text,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    # Remove any trailing sources block the LLM might have hallucinated
+    # Covers: Источник, Источники, Sources, Литература, References
+    text = re.sub(
+        r"\n+(?:---\s*)?\*?\*?(?:Источник[иа]?|Sources?|Литература|References)\*?\*?:.*$",
+        "",
+        text,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    return text.strip()
+
+
+# ── API helpers ───────────────────────────────────────────────────────────────
+
+def _call_medical_api(
+    messages: list[dict],
+    question: str,
+    context: str,
+    max_tokens: int = 1024,
+) -> str:
+    """
+    POST to the medical API.
+    All four root fields (messages, question, context, max_tokens) are required.
+    No content field may be empty/None — causes 422.
     """
     if not MEDICAL_API_KEY:
-        raise ValueError(
-            "API_KEY not set. Please set API_KEY environment variable or in .env file"
-        )
-    
-    headers = {
-        "Authorization": f"Bearer {MEDICAL_API_KEY}"
-    }
-    
-    body = {
-        "question": question,
-        "context": context,
-        "system_prompt": SYSTEM_PROMPT,
+        raise ValueError("API_KEY not set. Add API_KEY to .env")
+
+    safe_messages = [
+        {"role": m["role"], "content": m.get("content", "").strip() or " "}
+        for m in messages
+    ]
+
+    payload = {
+        "messages": safe_messages,
+        "question": question.strip() or " ",
+        "context":  context.strip() or " ",
         "max_tokens": max_tokens,
         "language": "ru",
     }
 
+    logger.debug(
+        "→ API | sys_len=%d | user=%r | question=%r",
+        len(safe_messages[0]["content"]),
+        safe_messages[-1]["content"][:80],
+        payload["question"][:60],
+    )
+
     try:
-        response = httpx.post(
+        resp = httpx.post(
             MEDICAL_API_URL,
-            headers=headers,
-            json=body,
+            headers={"Authorization": f"Bearer {MEDICAL_API_KEY}"},
+            json=payload,
             timeout=60.0,
         )
-        response.raise_for_status()
-        
-        # Parse JSON response and extract answer
-        data = response.json()
+        resp.raise_for_status()
+        data = resp.json()
         return data.get("answer", data.get("text", str(data)))
-        
     except httpx.HTTPStatusError as e:
-        if e.response.status_code == 401:
-            raise ValueError("Invalid API_KEY. Check your authorization.")
-        elif e.response.status_code == 403:
-            raise ValueError("API_KEY forbidden. Check your credentials.")
-        elif e.response.status_code == 503:
-            raise ValueError("Medical API service unavailable. Model may be loading.")
-        else:
-            raise ValueError(f"API error {e.response.status_code}: {e.response.text}")
+        status = e.response.status_code
+        if status == 401:
+            raise ValueError("Invalid API_KEY.")
+        if status == 403:
+            raise ValueError("API_KEY forbidden.")
+        if status == 503:
+            raise ValueError("Medical API unavailable.")
+        raise ValueError(f"API error {status}: {e.response.text}")
     except httpx.TimeoutException:
-        raise ValueError("Request timed out. The model may be processing a large request.")
+        raise ValueError("Request timed out.")
     except Exception as e:
-        raise ValueError(f"Unexpected error calling medical API: {e}")
+        raise ValueError(f"Unexpected API error: {e}")
 
 
-def _get_response(question: str, top_k: int, max_tokens: int) -> str:
-    retriever = Retriever()
-    try: 
-        results = retriever.search(question, top_k=top_k)
-        context = _build_service_context(results)
+def _cleanup_query(raw_query: str) -> str:
+    """Patient mode only: extract 2-3 keyword search phrase via LLM."""
+    if not MEDICAL_API_KEY:
+        return raw_query
+    try:
+        messages = [
+            {"role": "system", "content": QUERY_CLEANUP_PROMPT},
+            {"role": "user",   "content": raw_query},
+        ]
+        cleaned = _call_medical_api(messages, question=raw_query, context=" ", max_tokens=15)
+        cleaned = cleaned.strip().strip('"').strip("'")
+        return cleaned if (cleaned and len(cleaned) < len(raw_query)) else raw_query
+    except Exception as exc:
+        logger.debug("Query cleanup failed, using raw query: %s", exc)
+        return raw_query
 
-        answer = _call_medical_api(question, context, max_tokens=max_tokens)
 
-        return answer, results
-    except Exception as e:
-        logger.error(f"Error in _get_response: {e}")
-        raise
-        
+# ── Core response function ────────────────────────────────────────────────────
 
-# ── Main chat loop ────────────────────────────────────────────────────────────
+def _get_response(
+    raw_query: str,
+    role: str,
+    protocol_retriever: Retriever,
+    service_retriever: Retriever | None,
+    top_k: int,
+    protocol_filters: dict | None,
+    max_tokens: int,
+) -> tuple[str, list[SearchResult], list[SearchResult]]:
+    """
+    Full pipeline: retrieve → build context → call LLM → clean output.
+
+    Returns
+    -------
+    answer          : str — text to display (source refs stripped for patient)
+    protocol_results: list[SearchResult]
+    service_results : list[SearchResult]
+    """
+    # 1. Query preparation
+    if role == "doctor":
+        search_query = raw_query            # preserve ICD codes as-is
+    else:
+        search_query = _cleanup_query(raw_query)  # extract 2-3 keywords
+
+    icd_codes = extract_icd_codes(raw_query)
+    min_score = _ROLES[role]["min_score"]
+
+    # 2. Retrieve from both sources
+    protocol_results = protocol_retriever.search(
+        search_query, top_k=top_k,
+        filters=protocol_filters,
+        icd_codes=icd_codes,
+        min_score=min_score,
+    )
+
+    service_results: list[SearchResult] = []
+    if service_retriever:
+        try:
+            service_results = service_retriever.search(
+                search_query, top_k=top_k,
+                icd_codes=icd_codes,
+                min_score=min_score,
+            )
+        except Exception as exc:
+            logger.warning("Service retrieval failed: %s", exc)
+
+    # 3. Build context string
+    context_parts = []
+    if protocol_results:
+        context_parts.append("=== Клинические протоколы ===\n" + _build_protocol_context(protocol_results))
+    if service_results:
+        context_parts.append("=== Реестр медицинских услуг ===\n" + _build_service_context(service_results))
+    context = "\n\n".join(context_parts)
+
+    # 4. Build messages (role-specific)
+    if role == "patient":
+        messages = [
+            {"role": "system", "content": PATIENT_SYSTEM_PROMPT.format(context=context)},
+            {"role": "user",   "content": raw_query},
+        ]
+    else:
+        messages = [
+            {"role": "system", "content": DOCTOR_PROMPT},
+            {"role": "user",   "content": f"Контекст:\n{context}\n\nВопрос: {raw_query}"},
+        ]
+
+    # 5. Call LLM — single call, result used exactly once
+    answer = _call_medical_api(messages, question=raw_query, context=context, max_tokens=max_tokens)
+
+    # 6. Patient post-processing: strip [N] refs and any hallucinated source block
+    if role == "patient":
+        answer = _strip_source_refs(answer)
+
+    return answer, protocol_results, service_results
+
+
+# ── Retrievers ────────────────────────────────────────────────────────────────
 
 def _try_service_retriever() -> Retriever | None:
-    """Return a Retriever for the services collection, or None if not indexed yet."""
     try:
-        r = Retriever(
-            collection=settings.SERVICES_COLLECTION,
-            icd_field="icd_code",   # services store a single ICD string
-        )
+        r = Retriever(collection=settings.SERVICES_COLLECTION, icd_field="icd_code")
         r._client.get_collection(settings.SERVICES_COLLECTION)
         return r
     except Exception:
         return None
 
 
+# ── Main chat loop ────────────────────────────────────────────────────────────
+
 def chat(
     top_k: int = settings.TOP_K,
     category: str | None = None,
     max_tokens: int = 1024,
+    initial_role: str = "doctor",
 ) -> None:
-    # Protocols use icd_codes (array); services use icd_code (string)
     protocol_retriever = Retriever(icd_field="icd_codes")
     service_retriever = _try_service_retriever()
     protocol_filters = {"category": category} if category else None
+    role = initial_role if initial_role in _ROLES else "doctor"
 
     print("\n=== Medical Protocol RAG — Kazakhstan Clinical Guidelines ===")
-    print(f"API Endpoint: {MEDICAL_API_URL}")
     print(f"API Key: {'✓ Set' if MEDICAL_API_KEY else '✗ NOT SET'}")
-    print(f"Services DB: {'✓ Ready' if service_retriever else '✗ Not indexed (run python -m rag.indexer_services)'}")
-    print("Commands: /quit  /clear  /sources\n")
-    if category:
-        print(f"Filter: category = {category}")
+    print(f"Services DB: {'✓ Ready' if service_retriever else '✗ Not indexed'}")
+    print(f"Mode: {_ROLES[role]['label']}  (switch with /doctor or /patient)")
+    print("Commands: /doctor  /patient  /clear  /sources  /quit\n")
 
     last_protocol_results: list[SearchResult] = []
     last_service_results: list[SearchResult] = []
 
     while True:
+        label = _ROLES[role]["label"]
         try:
-            query = input("You: ").strip()
+            raw_query = input(f"[{label}] You: ").strip()
         except (EOFError, KeyboardInterrupt):
             print("\nBye.")
             break
 
-        if not query:
+        if not raw_query:
             continue
-        if query.lower() in ("/quit", "/exit"):
+
+        # ── Commands ──────────────────────────────────────────────────────────
+        cmd = raw_query.lower()
+        if cmd in ("/quit", "/exit"):
             print("Bye.")
             break
-        if query.lower() == "/clear":
+        if cmd == "/doctor":
+            role = "doctor"
+            print(f"Mode → {_ROLES[role]['label']} (threshold: {_ROLES[role]['min_score']})\n")
+            continue
+        if cmd == "/patient":
+            role = "patient"
+            print(f"Mode → {_ROLES[role]['label']} (threshold: {_ROLES[role]['min_score']})\n")
+            continue
+        if cmd == "/clear":
             last_protocol_results.clear()
             last_service_results.clear()
-            print("Conversation cleared.")
+            print("Conversation cleared.\n")
             continue
-        if query.lower() == "/sources":
+        if cmd == "/sources":
             src = _format_sources(last_protocol_results, last_service_results)
             print(src if src else "No sources from previous answer.")
             continue
 
-        # Detect ICD-10 codes in the query for exact-match priority
-        icd_codes = extract_icd_codes(query)
-
-        # 1. Retrieve from clinical protocols (exact ICD match + semantic)
+        # ── Get response ──────────────────────────────────────────────────────
         try:
-            protocol_results = protocol_retriever.search(
-                query, top_k=top_k, filters=protocol_filters, icd_codes=icd_codes,
+            answer, protocol_results, service_results = _get_response(
+                raw_query=raw_query,
+                role=role,
+                protocol_retriever=protocol_retriever,
+                service_retriever=service_retriever,
+                top_k=top_k,
+                protocol_filters=protocol_filters,
+                max_tokens=max_tokens,
             )
-            last_protocol_results = protocol_results
         except Exception as exc:
-            print(f"[Protocol retrieval error: {exc}]")
+            print(f"[Error: {exc}]\n")
             continue
 
-        # 2. Retrieve from services DB (best-effort)
-        service_results: list[SearchResult] = []
-        if service_retriever:
-            try:
-                service_results = service_retriever.search(
-                    query, top_k=top_k, icd_codes=icd_codes,
-                )
-                last_service_results = service_results
-            except Exception as exc:
-                logger.warning("Service retrieval failed: %s", exc)
+        # Save for /sources command
+        last_protocol_results = protocol_results
+        last_service_results = service_results
 
-        # 3. No results — give specific message for ICD queries
+        # ── No results ────────────────────────────────────────────────────────
         if not protocol_results and not service_results:
+            icd_codes = extract_icd_codes(raw_query)
             if icd_codes:
-                print(f"Assistant: К сожалению, в базе нет данных по коду МКБ-10: {', '.join(icd_codes)}\n")
+                print(f"\nAssistant: К сожалению, в базе нет данных по коду МКБ-10: {', '.join(icd_codes)}\n")
             else:
-                print("Assistant: Релевантные данные не найдены. Попробуйте переформулировать вопрос.\n")
+                print("\nAssistant: В официальных протоколах нет точного совпадения. "
+                      "Пожалуйста, обратитесь к врачу.\n")
             continue
 
-        # 4. Build combined context
-        context_parts = []
-        if protocol_results:
-            context_parts.append("=== Клинические протоколы ===\n" + _build_protocol_context(protocol_results))
-        if service_results:
-            context_parts.append("=== Реестр медицинских услуг ===\n" + _build_service_context(service_results))
-        context = "\n\n".join(context_parts)
-
-        # 5. Call medical API
-        try:
-            answer = _call_medical_api(question=query, context=context, max_tokens=max_tokens)
-        except Exception as exc:
-            print(f"[API error: {exc}]")
-            continue
-
-        # Output: answer → service table → sources (each appears exactly once)
+        # ── Output (printed exactly once) ─────────────────────────────────────
         print(f"\nAssistant: {answer}")
-        if service_results:
-            print(f"\n**Реестр медицинских услуг:**\n{_render_service_table(service_results)}")
-        print(_format_sources(protocol_results, service_results))
+
+        if role == "doctor":
+            # Doctor sees the service table + full sources
+            if service_results:
+                print(f"\n**Реестр медицинских услуг:**\n{_render_service_table(service_results)}")
+            print(_format_sources(protocol_results, service_results))
+        # Patient: LLM already rendered the table inside `answer`; sources are
+        # stored in last_protocol_results/last_service_results for /sources command
+        # but never printed automatically.
+
         print()
 
 
@@ -292,14 +407,13 @@ def main() -> None:
     import argparse
 
     parser = argparse.ArgumentParser(description="Medical RAG Chat CLI")
-    parser.add_argument("--top-k", type=int, default=settings.TOP_K,
-                        help="Number of retrieved chunks per source (default: %(default)s)")
+    parser.add_argument("--top-k", type=int, default=settings.TOP_K)
     parser.add_argument("--category", default=None,
                         help="Filter protocols by specialty, e.g. 'Кардиология'")
-    parser.add_argument("--max-tokens", type=int, default=1024,
-                        help="Maximum tokens for API response (default: 1024)")
-    parser.add_argument("--api-key", default=None,
-                        help="API key for medical endpoint (overrides .env)")
+    parser.add_argument("--max-tokens", type=int, default=1024)
+    parser.add_argument("--api-key", default=None)
+    parser.add_argument("--role", default="doctor", choices=["doctor", "patient"],
+                        help="Starting role: doctor (default) or patient")
     args = parser.parse_args()
 
     if args.api_key:
@@ -313,7 +427,12 @@ def main() -> None:
         sys.exit(1)
 
     logging.basicConfig(level=logging.WARNING)
-    chat(top_k=args.top_k, category=args.category, max_tokens=args.max_tokens)
+    chat(
+        top_k=args.top_k,
+        category=args.category,
+        max_tokens=args.max_tokens,
+        initial_role=args.role,
+    )
 
 
 if __name__ == "__main__":
