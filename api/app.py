@@ -3,9 +3,14 @@ import dataclasses
 from fastapi import FastAPI
 from pydantic import BaseModel
 
-from rag.chat import _get_response
+from rag.chat import _get_response, _try_service_retriever
+from rag.retriever import Retriever
 
 app = FastAPI()
+
+# Initialize once at startup, reuse across requests
+_protocol_retriever = Retriever(icd_field="icd_codes")
+_service_retriever = _try_service_retriever()
 
 
 class QuestionRequest(BaseModel):
@@ -14,6 +19,7 @@ class QuestionRequest(BaseModel):
     context: str = ""
     top_k: int = 5
     max_tokens: int = 1024
+    category: str | None = None
 
 
 @app.get("/")
@@ -24,15 +30,23 @@ def health():
 @app.post("/ask")
 async def ask_question(request: QuestionRequest):
     try:
-        answer, results = _get_response(
-            request.question,
+        protocol_filters = {"category": request.category} if request.category else None
+
+        answer, protocol_results, service_results = _get_response(
+            raw_query=request.question,
             role=request.role,
-            context_patient=request.context,
+            protocol_retriever=_protocol_retriever,
+            service_retriever=_service_retriever,
+            protocol_filters=protocol_filters,
             top_k=request.top_k,
             max_tokens=request.max_tokens,
+            context_patient=request.context,
         )
-        # SearchResult is a dataclass; convert to plain dicts for JSON serialization
-        sources = [dataclasses.asdict(r) for r in results]
-        return {"answer": answer, "sources": sources}
+
+        return {
+            "answer": answer,
+            "protocol_sources": [dataclasses.asdict(r) for r in protocol_results],
+            "service_sources": [dataclasses.asdict(r) for r in service_results],
+        }
     except Exception as e:
         return {"error": str(e)}
