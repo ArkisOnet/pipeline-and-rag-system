@@ -11,6 +11,7 @@ app = FastAPI()
 class QuestionRequest(BaseModel):
     question: str
     role: str = "patient"
+    context: str = ""
     top_k: int = 5
     max_tokens: int = 1024
 
@@ -26,6 +27,7 @@ async def ask_question(request: QuestionRequest):
         answer, results = _get_response(
             request.question,
             role=request.role,
+            context_patient=request.context,
             top_k=request.top_k,
             max_tokens=request.max_tokens,
         )

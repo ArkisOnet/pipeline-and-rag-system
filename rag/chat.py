@@ -224,6 +224,7 @@ def _get_response(
     top_k: int,
     protocol_filters: dict | None,
     max_tokens: int,
+    context_patient: str = ""
 ) -> tuple[str, list[SearchResult], list[SearchResult]]:
     """
     Full pipeline: retrieve → build context → call LLM → clean output.
@@ -235,14 +236,15 @@ def _get_response(
     service_results : list[SearchResult]
     """
     # 1. Query preparation
+    if len(context_patient) > 2000: 
+        logger.warning("Context patient is more than 2000 characters, strip it up to 2000")
+        context_patient = context_patient[:2000]
     if role == "doctor":
         search_query = raw_query            # preserve ICD codes as-is
     else:
         search_query = _cleanup_query(raw_query)  # extract 2-3 keywords
-
     icd_codes = extract_icd_codes(raw_query)
     min_score = _ROLES[role]["min_score"]
-
     # 2. Retrieve from both sources
     protocol_results = protocol_retriever.search(
         search_query, top_k=top_k,
@@ -268,6 +270,8 @@ def _get_response(
         context_parts.append("=== Клинические протоколы ===\n" + _build_protocol_context(protocol_results))
     if service_results:
         context_parts.append("=== Реестр медицинских услуг ===\n" + _build_service_context(service_results))
+    if context_patient: 
+        context_parts.append("=== Данны о пациенте === \n" + context_patient)
     context = "\n\n".join(context_parts)
 
     # 4. Build messages (role-specific)
